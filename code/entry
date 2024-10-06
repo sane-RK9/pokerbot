@@ -1,1 +1,269 @@
+import tensorflow as tf
+import numpy as np
+import random
+import os
+from collections import Counter
+from tensorflow.keras import layers, models
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import xgboost as xgb
+
+# ----------------------------- #
+#          Deck & Mapping       #
+# ----------------------------- #
+def create_deck():
+    ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "Jack", "Queen", "King", "Ace"]
+    suits = ["Hearts", "Diamonds", "Clubs", "Spades"]
+    return [(rank, suit) for rank in ranks for suit in suits]
+
+rank_values = {rank: idx for idx, rank in enumerate(["2", "3", "4", "5", "6", "7", "8", "9", "10", "Jack", "Queen", "King", "Ace"], start=2)}
+suit_values = {suit: idx for idx, suit in enumerate(["Hearts", "Diamonds", "Clubs", "Spades"])}
+
+# ----------------------------- #
+#       Feature Engineering     #
+# ----------------------------- #
+def create_features(hole_cards, community_cards):
+    full_hand = hole_cards + community_cards
+    ranks = sorted([rank_values[card[0]] for card in full_hand])
+    suits = [suit_values[card[1]] for card in full_hand]
+
+    rank_counts = Counter(ranks)
+    suit_counts = Counter(suits)
+
+    community_card_features = [0] * 5
+    community_card_features[:len(community_cards)] = [rank_values[card[0]] for card in community_cards]
+
+    features = ranks + community_card_features + [rank_counts.get(r, 0) for r in range(2, 15)] + [suit_counts.get(s, 0) for s in range(4)]
+    features += [int(is_flush(suits)), int(is_straight(ranks))]
+
+    return np.pad(features, (0, 7 - len(ranks)), 'constant')[:7 + 13 + 4 + 2]
+
+def is_flush(suits):
+    return len(set(suits)) == 1
+
+def is_straight(ranks):
+    return max(ranks) - min(ranks) == len(ranks) - 1 and len(set(ranks)) == len(ranks)
+
+# ----------------------------- #
+#        Dataset Generation     #
+# ----------------------------- #
+def generate_hand(num_hole_cards, num_community_cards, exclude=None):
+    deck = set(create_deck()) - set(exclude) if exclude else set(create_deck())
+    hole_cards = random.sample(deck, num_hole_cards)
+    deck -= set(hole_cards)
+    community_cards = random.sample(deck, num_community_cards)
+    return hole_cards, community_cards
+
+def assign_rank(hole_cards, community_cards):
+    full_hand = hole_cards + community_cards
+    return sum(rank_values[card[0]] for card in full_hand)
+
+def create_dataset(samples=10000, num_hole_cards=2, num_community_cards=5):
+    X, y = [], []
+    for _ in range(samples):
+        hole_cards, community_cards = generate_hand(num_hole_cards, num_community_cards)
+        features = create_features(hole_cards, community_cards)
+        rank = assign_rank(hole_cards, community_cards)
+        X.append(features)
+        y.append(rank)
+    return np.array(X), np.array(y)
+
+# ----------------------------- #
+#        Model Building         #
+# ----------------------------- #
+def build_model(input_dim, model_type='nn'):
+    if model_type == 'nn':
+        model = models.Sequential([
+            layers.Dense(512, activation='relu', input_dim=input_dim),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(256, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(128, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(64, activation='relu'),
+            layers.Dense(1)
+        ])
+        model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
+        return model
+    elif model_type == 'xgb':
+        return {
+            'objective': 'reg:squarederror',
+            'max_depth': 6,
+            'eta': 0.1,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'seed': 42
+        }
+
+def train_models(X_train, y_train, X_val, y_val, epochs=100):
+    nn_model = build_model(X_train.shape[1], 'nn')
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+    ]
+    nn_model.fit(X_train, y_train, validation_data=(X_val, y_val),
+                 epochs=epochs, batch_size=64, callbacks=callbacks, verbose=1)
+    nn_model.save('nn_model.h5')
+
+    dtrain, dval = xgb.DMatrix(X_train, label=y_train), xgb.DMatrix(X_val, label=y_val)
+    params = build_model(None, 'xgb')
+    xgb_model = xgb.train(params, dtrain, num_boost_round=100, evals=[(dtrain, 'train'), (dval, 'eval')],
+                          early_stopping_rounds=10, verbose_eval=True)
+    xgb_model.save_model('xgb_model.json')
+
+    return nn_model, xgb_model
+
+# ----------------------------- #
+#         Evaluation            #
+# ----------------------------- #
+def load_models():
+    nn_model = tf.keras.models.load_model('nn_model.h5') if os.path.exists('nn_model.h5') else None
+    xgb_model = xgb.Booster()
+    if os.path.exists('xgb_model.json'):
+        xgb_model.load_model('xgb_model.json')
+    else:
+        xgb_model = None
+    return nn_model, xgb_model
+
+def evaluate_hand(hole_cards, community_cards, models):
+    features = create_features(hole_cards, community_cards).reshape(1, -1)
+    nn_model, xgb_model = models
+    preds = {}
+    if nn_model:
+        preds['nn'] = nn_model.predict(features)[0][0]
+    if xgb_model:
+        preds['xgb'] = xgb_model.predict(xgb.DMatrix(features))[0]
+    return preds
+
+def calculate_win_prob(hole_cards, community_cards, num_players=2, simulations=1000):
+    player_rank = assign_rank(hole_cards, community_cards)
+    deck = set(create_deck()) - set(hole_cards) - set(community_cards)
+    wins, ties, losses = 0, 0, 0
+
+    for _ in range(simulations):
+        opp_hands = []
+        for _ in range(num_players - 1):
+            opp_hole_cards = random.sample(deck, len(hole_cards))
+            opp_rank = assign_rank(opp_hole_cards, community_cards)
+            opp_hands.append(opp_rank)
+
+        if all(player_rank > opp_rank for opp_rank in opp_hands):
+            wins += 1
+        elif any(player_rank == opp_rank for opp_rank in opp_hands):
+            ties += 1
+        else:
+            losses += 1
+
+    probs = (wins / simulations, ties / simulations, losses / simulations)
+    print(f"Wins: {probs[0]*100:.2f}%, Ties: {probs[1]*100:.2f}%, Losses: {probs[2]*100:.2f}%")
+    return probs
+
+# ----------------------------- #
+#   Expected Value Calculation   #
+# ----------------------------- #
+def calculate_ev(win_prob, pot_size, bet_size):
+    losses = (1 - win_prob) * bet_size
+    ev = (win_prob * pot_size) - losses
+    return ev
+
+# ----------------------------- #
+#  Suggest Bet Function         #
+# ----------------------------- #
+def suggest_bet(win_prob, pot_size=100, bet_size=20):
+    pot_odds = bet_size / (pot_size + bet_size) if pot_size + bet_size > 0 else 0
+    win_probability = win_prob[0]
+    ev = calculate_ev(win_probability, pot_size, bet_size)
+
+    if ev >= 0:
+        if win_probability >= 0.70:
+            raise_amount = min(pot_size / 2, pot_size)
+            return f"Raise by {raise_amount:.2f}"
+        elif win_probability >= 0.40 and win_probability >= pot_odds:
+            return "Call"
+        else:
+            return "Fold"
+    else:
+        return "Fold"
+
+# ----------------------------- #
+#              Main             #
+# ----------------------------- #
+def main():
+    random.seed(42)
+    np.random.seed(42)
+    tf.random.set_seed(42)
+
+    # Step 1: Create dataset
+    print("Generating dataset...")
+    X, y = create_dataset(samples=10000)
+
+    # Step 2: Split dataset into training and validation sets
+    split_index = int(len(X) * 0.8)
+    X_train, X_val = X[:split_index], X[split_index:]
+    y_train, y_val = y[:split_index], y[split_index:]
+
+    # Step 3: Train models
+    print("Training models...")
+    nn_model, xgb_model = train_models(X_train, y_train, X_val, y_val, epochs=100)
+
+    # Step 4: Load models
+    print("Loading models...")
+    models = load_models()
+
+    # Step 5: Game simulation or evaluation loop
+    print("\nWelcome to the Poker Simulation!")
+    total_chips = float(input("Enter total chips: "))  # Total chips of the player
+
+    while True:
+        try:
+            num_players = int(input("\nEnter number of players (including yourself): "))
+            if num_players < 2:
+                print("There must be at least 2 players.")
+                continue
+
+            print("Enter your hole cards (e.g., 'Ace of Hearts, King of Spades'): ")
+            hole_cards_input = input().strip().split(',')
+            hole_cards = [tuple(card.strip().split(' of ')) for card in hole_cards_input]
+
+            community_cards_input = input("Enter community cards (or press Enter to skip): ")
+            community_cards = []
+            if community_cards_input:
+                community_cards = [tuple(card.strip().split(' of ')) for card in community_cards_input.split(',')]
+
+            pot_size = float(input("Enter current pot size: "))  # Current pot size
+            bet_size = float(input("Enter size of the current bet: "))  # Size of the current bet
+
+            # Validate opponent actions
+            opponents_actions = []
+            for i in range(num_players - 1):
+                action = input(f"Enter action for opponent {i + 1} (Check, Call, Raise, Fold): ").strip().lower()
+                if action not in ['check', 'call', 'raise', 'fold']:
+                    print("Invalid action. Please enter Check, Call, Raise, or Fold.")
+                    continue
+                opponents_actions.append(action)
+
+            # Evaluate hand
+            print("\nEvaluating hand...")
+            preds = evaluate_hand(hole_cards, community_cards, models)
+            print(f"Predictions: {preds}")
+
+            # Calculate win probability
+            win_prob = calculate_win_prob(hole_cards, community_cards, num_players=num_players)
+
+            # Suggest betting action
+            suggested_action = suggest_bet(win_prob, pot_size=pot_size, bet_size=bet_size)
+            print(f"Suggested action: {suggested_action}")
+
+            # Wait for the next round or exit
+            if input("\nType 'exit' to stop or press Enter to continue...").lower() == 'exit':
+                break
+        except ValueError as e:
+            print(f"Error: {e}. Please enter valid numeric values.")
+
+    print("Exiting the game. Goodbye!")
+
+if __name__ == "__main__":
+    main()
 
